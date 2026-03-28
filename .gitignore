@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments (do not commit the venv itself)
+venv/
+.venv/
+env/
+
+# VS Code (keep extensions.json, ignore local settings)
+.vscode/settings.json
+.vscode/launch.json
+
+#Model weights and large binaries (store on ModelWarehouse directly)
+*.gguf
+*.safetensors
+*.pt
+*.bin
+
+# OS noise
+.DS_Store
+Thumbs.db
