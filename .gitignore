@@ -21,3 +21,8 @@ env/
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Secrets
+.env
+*.env
+.env.*
