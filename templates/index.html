@@ -349,6 +349,42 @@ textarea.prompt-ta::placeholder { color: var(--text-dim); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Trends ─────────────────────────────────────────────────────────────── */
+.trend-select {
+  width: 100%; background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 8px 12px;
+  font-size: 12px; font-family: var(--font); outline: none; cursor: pointer;
+}
+.trend-select:focus { border-color: var(--accent); }
+.trend-date {
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 8px 12px;
+  font-size: 12px; font-family: var(--font); outline: none;
+}
+.trend-date:focus { border-color: var(--accent); }
+.compare-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px;
+}
+.compare-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px;
+}
+.compare-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-dim); margin-bottom: 12px; font-weight: 600;
+}
+.compare-stat {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+  font-size: 12px;
+}
+.compare-stat:last-child { border-bottom: none; }
+.compare-stat-label { color: var(--text-dim); }
+.compare-stat-val   { font-weight: 600; color: var(--text); }
+.delta-good { color: var(--ok); }
+.delta-bad  { color: var(--danger); }
+.delta-neutral { color: var(--text-dim); }
+
 * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 </style>
 </head>
@@ -400,6 +436,14 @@ textarea.prompt-ta::placeholder { color: var(--text-dim); }
         <line x1="8" y1="11" x2="14" y2="11"/>
       </svg>
       <span class="nav-tip">Diagnostics</span>
+    </button>
+
+    <button class="nav-btn" onclick="switchPreset('trends',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/>
+        <polyline points="16 7 22 7 22 13"/>
+      </svg>
+      <span class="nav-tip">Bandwidth Trends</span>
     </button>
 
     <div class="sidebar-gap"></div>
@@ -522,6 +566,7 @@ const TITLES = {
   health:      'Device Health',
   performance: 'Network Performance',
   diagnostics: 'Data Diagnostics',
+  trends:      'Bandwidth Trends',
 };
 
 // ── Boot ───────────────────────────────────────────────────────────────────
@@ -579,10 +624,22 @@ function switchPreset(p, btn) {
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   id('preset-title').textContent = TITLES[p] || p;
+  resetAIPanel();
+
+  if (p === 'trends') {
+    id('analyzeBtn').style.display = 'none';
+    id('fetchBtn').style.display   = 'none';
+    loadTrends();
+    return;
+  }
+
+  // Restore buttons when switching away from trends
+  id('fetchBtn').style.display   = '';
+  id('analyzeBtn').style.display = '';
+  id('fetchBtn').disabled   = false;
+  id('analyzeBtn').disabled = true;
   id('dataPanel').innerHTML = `<div class="empty" style="margin-top:50px">
     Click <strong>Fetch Data</strong> to load ${TITLES[p]}</div>`;
-  id('analyzeBtn').disabled = true;
-  resetAIPanel();
 }
 
 // ── Fetch data ─────────────────────────────────────────────────────────────
@@ -629,6 +686,20 @@ function renderSecurity(d) {
     <td style="color:var(--text-dim)">${esc(c.type)}</td>
   </tr>`).join('') || `<tr><td colspan="4" class="empty">No clients</td></tr>`;
 
+  const rogueRows = (d.rogue_aps || []).map(r => {
+    const rssi = r.rssi != null ? r.rssi : null;
+    const rssiCol = rssi == null ? 'var(--text-dim)'
+      : rssi > -60 ? 'var(--danger)' : rssi > -75 ? 'var(--warn)' : 'var(--ok)';
+    const ssid = r.ssid ? esc(r.ssid) : '<span style="color:var(--text-dim);font-style:italic">hidden</span>';
+    return `<tr>
+      <td>${ssid}</td>
+      <td class="mono">${esc(r.bssid)}</td>
+      <td style="color:${rssiCol}">${rssi != null ? rssi + ' dBm' : '—'}</td>
+      <td style="color:var(--text-dim)">${esc(r.channel || '—')}</td>
+      <td style="color:var(--text-dim)">${esc(r.security || '—')}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="5" class="empty">No rogue APs</td></tr>`;
+
   const alarmItems = (d.alarms || []).length
     ? (d.alarms || []).map(a => `<li class="alarm-item">
         <div class="alarm-dot"></div><span>${esc(a)}</span></li>`).join('')
@@ -656,9 +727,23 @@ function renderSecurity(d) {
       <div class="metric-card">
         <div class="metric-label">Rogue APs</div>
         <div class="metric-val ${rogueCls}">${d.rogue_ap_count}</div>
-        <div class="metric-sub">neighboring nets</div>
+        <div class="metric-sub">${d.evil_twin_candidates && d.evil_twin_candidates.length
+          ? '<span style="color:var(--danger)">⚠ evil twin detected</span>'
+          : 'neighboring nets'}</div>
       </div>
     </div>
+    ${d.wan ? `
+    <div class="card" style="padding:11px 14px">
+      <div class="metric-label" style="margin-bottom:7px">WAN</div>
+      <div style="display:flex;gap:20px;font-size:11px;flex-wrap:wrap">
+        <span>${d.wan.status === 'ok'
+          ? '<span style="color:var(--ok)">● Connected</span>'
+          : '<span style="color:var(--danger)">● ' + esc(d.wan.status) + '</span>'}</span>
+        ${d.wan.latency != null ? `<span style="color:var(--text-dim)">Latency <strong style="color:var(--text)">${d.wan.latency} ms</strong></span>` : ''}
+        ${d.wan.rx_mb ? `<span style="color:var(--text-dim)">↓ ${d.wan.rx_mb} MB</span>` : ''}
+        ${d.wan.tx_mb ? `<span style="color:var(--text-dim)">↑ ${d.wan.tx_mb} MB</span>` : ''}
+      </div>
+    </div>` : ''}
 
     <div class="card">
       <div class="card-head">
@@ -668,6 +753,31 @@ function renderSecurity(d) {
       <div class="tbl-wrap"><table>
         <thead><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Type</th></tr></thead>
         <tbody>${clientRows}</tbody>
+      </table></div>
+    </div>
+
+    ${d.evil_twin_candidates && d.evil_twin_candidates.length ? `
+    <div class="card" style="border-color:var(--danger)">
+      <div class="card-head" style="background:rgba(239,68,68,0.08)">
+        <span class="card-title" style="color:var(--danger)">⚠ Evil Twin Candidates</span>
+        <span class="badge danger">${d.evil_twin_candidates.length}</span>
+      </div>
+      <div style="padding:10px 14px;font-size:11px;color:var(--danger)">
+        SSIDs matching your own network names detected from unknown BSSIDs:
+        ${d.evil_twin_candidates.map(b => `<div class="mono" style="margin-top:4px">${esc(b)}</div>`).join('')}
+      </div>
+    </div>` : ''}
+
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">Rogue APs (${d.rogue_ap_count} total · showing top 30 by signal)</span>
+        <span class="badge ${rogueCls}">${d.rogue_ap_count}</span>
+      </div>
+      <div class="tbl-wrap" style="max-height:220px;overflow-y:auto"><table>
+        <thead><tr>
+          <th>SSID</th><th>BSSID</th><th>RSSI</th><th>Ch</th><th>Security</th>
+        </tr></thead>
+        <tbody>${rogueRows}</tbody>
       </table></div>
     </div>
 

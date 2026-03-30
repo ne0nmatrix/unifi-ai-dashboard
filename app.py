@@ -12,11 +12,12 @@ from flask import Flask, jsonify, render_template, request, Response, stream_wit
 from unifi_client import UniFiClient
 from lmstudio_client import LMStudioClient
 from prompts import build_security_prompt, build_health_prompt, build_performance_prompt
+from db import init_db, save_snapshot, get_known_clients, get_before_after
 
 load_dotenv()
-print(f"DEBUG model={os.getenv('LLM_MODEL')!r}")  # add this temporarily
 
 app = Flask(__name__)
+init_db()  # ensure tables exist on startup
 
 unifi = UniFiClient(
     console_ip=os.getenv("UNIFI_CONSOLE_IP"),
@@ -58,7 +59,14 @@ def get_data(preset):
         }
         if preset not in fetchers:
             return jsonify({"ok": False, "error": f"Unknown preset: {preset}"}), 400
-        return jsonify({"ok": True, "data": fetchers[preset]()})
+        result = fetchers[preset]()
+        # Snapshot raw clients on every fetch for trend tracking
+        try:
+            raw_clients = unifi._clients()
+            save_snapshot(raw_clients)
+        except Exception:
+            pass  # never let snapshot failure break the main response
+        return jsonify({"ok": True, "data": result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -83,7 +91,7 @@ def analyze():
         prompt = builders.get(preset, build_security_prompt)(data)
 
     def generate():
-        for chunk in lmstudio.stream_inference(prompt, model=model): # type: ignore
+        for chunk in lmstudio.stream_inference(prompt, model=model):
             yield f"data: {json.dumps({'chunk': chunk})}\n\n"
         yield f"data: {json.dumps({'done': True})}\n\n"
 
@@ -110,6 +118,20 @@ def load_model():
 def unload_model():
     model_id = (request.json or {}).get("model_id", "")
     return jsonify(lmstudio.unload_model(model_id))
+
+
+# ── Trends ───────────────────────────────────────────────────────────────────
+@app.route("/api/trends/clients")
+def trends_clients():
+    return jsonify(get_known_clients())
+
+@app.route("/api/trends/compare")
+def trends_compare():
+    mac        = request.args.get("mac", "")
+    split_date = request.args.get("split_date", "")
+    if not mac or not split_date:
+        return jsonify({"ok": False, "error": "mac and split_date are required"}), 400
+    return jsonify(get_before_after(mac, split_date))
 
 
 # ── Launch ────────────────────────────────────────────────────────────────────

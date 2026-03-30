@@ -215,9 +215,20 @@ class UniFiClient:
             or "block" in str(e.get("msg", "")).lower()
         ]
 
+        # WAN summary for broadband context
+        health = self._health()
+        wan = next((h for h in health if h.get("subsystem") == "wan"), {})
+        wan_info = {
+            "status":  wan.get("status", "unknown"),
+            "latency": wan.get("latency"),
+            "rx_mb":   _mb(wan.get("rx_bytes")),
+            "tx_mb":   _mb(wan.get("tx_bytes")),
+        }
+
         return {
             "preset":          "security",
             "period":          "last 24 hours",
+            "wan":             wan_info,
             "client_count":    len(client_rows),
             "clients":         client_rows,
             "alarm_count":     len(alarms),
@@ -227,7 +238,26 @@ class UniFiClient:
             "block_count":     len(blocks),
             "firewall_blocks": blocks[:10],
             "rogue_ap_count":  len(rogues),
-            "rogue_aps":       [r.get("ssid") or r.get("bssid", "?") for r in rogues[:10]],
+            # Full rogue AP detail for meaningful LLM analysis
+            "rogue_aps": [
+                {
+                    "ssid":     r.get("ssid", ""),
+                    "bssid":    r.get("bssid", ""),
+                    "rssi":     r.get("rssi"),
+                    "channel":  r.get("channel"),
+                    "security": r.get("security", "unknown"),
+                    "is_adhoc": r.get("is_adhoc", False),
+                }
+                for r in sorted(rogues, key=lambda x: x.get("rssi") or -999, reverse=True)[:30]
+            ],
+            # Flag any rogue AP whose SSID matches one of our own networks
+            "evil_twin_candidates": [
+                r.get("bssid") for r in rogues
+                if r.get("ssid") and r.get("ssid") in [
+                    d.get("name","") for d in self._devices()
+                    if d.get("name")
+                ]
+            ],
         }
 
     def fetch_health_data(self):

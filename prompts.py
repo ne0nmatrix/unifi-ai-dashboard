@@ -4,22 +4,31 @@ import json
 
 
 def build_security_prompt(data: dict) -> str:
-    return f"""You are a network security analyst reviewing a home network (not enterprise).
+    return f"""You are a network security analyst reviewing a HOME network (not enterprise).
 
-Analyze the 24-hour security summary below. Look specifically for:
-- Port scanning or host enumeration patterns
-- New or unrecognized devices — flag their hostname and IP
-- Unusual outbound connection patterns or destinations
-- Slow beaconing (periodic connections at regular intervals to uncommon hosts)
-- Repeated firewall blocks from the same source IP
-- Rogue access points that may be impersonating known SSIDs
-- Brute-force attempts on any exposed service
-- Multi-event chains that individually look innocent but together suggest compromise
+Analyze the 24-hour security summary below.
 
-Instructions:
+ROGUE AP ANALYSIS RULES — read carefully before flagging:
+- A home network in a residential area will routinely detect 50-150+ rogue APs — these are
+  neighbor routers, mesh nodes, IoT devices. High counts alone are NOT suspicious.
+- Only flag rogue APs as HIGH if: (a) an SSID matches one of the homeowner's own network
+  names (evil twin), OR (b) RSSI is stronger than -60 dBm (physically very close, not a
+  neighbor), OR (c) is_adhoc is true AND signal is strong.
+- If evil_twin_candidates list is empty, rogue APs are almost certainly neighbor noise — rate LOW.
+- Do NOT flag rogue AP count as HIGH purely based on volume in a residential context.
+- Rogue APs with no SSID (empty string) are typically probe responses — not threats.
+
+WAN / BROADBAND ANALYSIS:
+- WAN data is provided where available from the UniFi health endpoint.
+- Do not request ISP-specific data — it is not available via the local API.
+- Comment on latency or unusual tx/rx ratios if the data warrants it.
+
+GENERAL INSTRUCTIONS:
+- Look for: port scanning, new unrecognized devices, unusual outbound patterns,
+  slow beaconing, brute-force attempts, multi-event compromise chains.
 - Rate each finding: HIGH / MED / LOW
-- Reference specific IPs, hostnames, or MACs from the data where relevant
-- If nothing is genuinely suspicious, say so — do not invent concerns
+- Reference specific IPs, hostnames, MACs, SSIDs, or RSSI values from the data
+- If nothing is genuinely suspicious, say so clearly — do not invent concerns
 - Bullet points, concise
 - End with a single-line overall verdict
 
@@ -61,6 +70,15 @@ Analyze the performance summary below. Look for:
 - Large upload volumes that could indicate unexpected cloud sync, backup, or exfiltration
 - Any client whose traffic pattern stands out as anomalous for a home network
 - Overall network health and whether any intervention would help
+
+IMPORTANT CONTEXT:
+- This is a HOME network. Cloud sync (iCloud, Dropbox, OneDrive), Windows Update
+  delivery optimization, and security camera uploads are all normal upload sources.
+- Infrastructure IPs (cable modem, router/gateway, switches) appear in the client
+  list — their traffic is network overhead, not user activity. Do not flag them.
+- Security cameras are expected to have high TX (upload) — only flag if one camera
+  is dramatically inconsistent vs others on the same network.
+- Do NOT request ISP or WAN provider information — unavailable via the local API.
 
 Instructions:
 - Rate each finding: HIGH / MED / LOW
