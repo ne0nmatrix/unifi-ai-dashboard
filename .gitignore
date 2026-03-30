@@ -26,3 +26,7 @@ Thumbs.db
 .env
 *.env
 .env.*
+
+# Runtime data
+*.db
+security_reports/
