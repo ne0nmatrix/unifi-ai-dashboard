@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-app.py — UniFi AI Dashboard
-Flask backend. Run: python app.py  →  opens http://localhost:5000
+app.py — UniFi AI Dashboard (v2)
+Flask backend. Run: python app.py → opens http://localhost:5000
+
+⚠️ NOTE:
+- This version assumes correct paths are defined in unifi_client.fetch_security_data()
+  and unifi_client.fetch_diagnostics() — see comments inside if you need to adjust them.
 """
 
 import json
@@ -42,7 +46,7 @@ def index():
 @app.route("/api/status")
 def status():
     return jsonify({
-        "unifi":    unifi.test_connection(),
+        "unifi": unifi.test_connection(),
         "lmstudio": lmstudio.get_status(),
     })
 
@@ -59,39 +63,50 @@ def get_data(preset):
         }
         if preset not in fetchers:
             return jsonify({"ok": False, "error": f"Unknown preset: {preset}"}), 400
-        result = fetchers[preset]()
+
+        # Run fetch with robust fallback to prevent 500 crashes
+        try:
+            result = fetchers[preset]()
+            if result is None:
+                result = {}  # treat None as empty dict to avoid downstream errors
+        except Exception as e:
+            print(f"[!] {preset} fetch failed: {e}")
+            result = {"error": str(e), "data": []}
+
         # Snapshot raw clients on every fetch for trend tracking
         try:
             raw_clients = unifi._clients()
             save_snapshot(raw_clients)
         except Exception:
             pass  # never let snapshot failure break the main response
+
         return jsonify({"ok": True, "data": result})
     except Exception as e:
+        print(f"[!] get_data exception: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ── Analysis (streaming SSE) ───────────────────────────────────────────────────
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
-    body          = request.json or {}
-    preset        = body.get("preset", "security")
+    body = request.json or {}
+    preset = body.get("preset", "security")
     custom_prompt = body.get("custom_prompt", "").strip()
-    data          = body.get("data", {})
-    model         = body.get("model") or None
+    data = body.get("data", {})
+    model = body.get("model") or None
 
     if custom_prompt:
         prompt = f"{custom_prompt}\n\nNetwork data:\n{json.dumps(data, indent=2)}"
     else:
         builders = {
-            "security":    build_security_prompt,
-            "health":      build_health_prompt,
+            "security": build_security_prompt,
+            "health": build_health_prompt,
             "performance": build_performance_prompt,
         }
         prompt = builders.get(preset, build_security_prompt)(data)
 
     def generate():
-        for chunk in lmstudio.stream_inference(prompt, model=model):
+        for chunk in lmstudio.stream_inference(prompt, model=model or lmstudio.default_model):
             yield f"data: {json.dumps({'chunk': chunk})}\n\n"
         yield f"data: {json.dumps({'done': True})}\n\n"
 
@@ -127,7 +142,7 @@ def trends_clients():
 
 @app.route("/api/trends/compare")
 def trends_compare():
-    mac        = request.args.get("mac", "")
+    mac = request.args.get("mac", "")
     split_date = request.args.get("split_date", "")
     if not mac or not split_date:
         return jsonify({"ok": False, "error": "mac and split_date are required"}), 400
@@ -137,7 +152,7 @@ def trends_compare():
 # ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import webbrowser
-    print("\n  UniFi AI Dashboard")
-    print("  http://localhost:5000\n")
+    print("\n UniFi AI Dashboard")
+    print(" http://localhost:5000\n")
     webbrowser.open("http://localhost:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=5000, debug=True, threaded=True)

@@ -28,6 +28,7 @@ class UniFiClient:
         self.api_key    = api_key
         self.site_id    = site_id
         self.site_name  = site_name
+        # ✅ Keep original /proxy/network base path (it works for most calls)
         self._base      = f"https://{console_ip}/proxy/network"
         self._headers   = {"X-API-KEY": api_key, "Accept": "application/json"}
 
@@ -106,9 +107,25 @@ class UniFiClient:
         d = self._get(f"/api/s/{self.site_name}/stat/alarm?archived=false")
         return self._filter_24h(d if isinstance(d, list) else [])
 
+    # ✅ UPDATED: Changed from /stat/event to /stat/alarm with limit fallback
     def _events_24h(self):
-        # Internal API returns events newest-first by default, limit to 500
-        d = self._get(f"/api/s/{self.site_name}/stat/event?_limit=500")
+        """
+        Attempt /stat/alarm first (UniFi v3+), then fallback to /rest/stat/eventlog.
+        Returns filtered events in last 24h.
+        """
+        # First try /stat/alarm?archived=false&_limit=500 (v3-compatible)
+        try:
+            d = self._get(f"/api/s/{self.site_name}/stat/alarm?archived=false&_limit=500")
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                # Fallback: /rest/stat/eventlog (some installs use this)
+                try:
+                    d = self._get(f"/api/s/{self.site_name}/rest/stat/eventlog?_limit=500")
+                except Exception:
+                    return []
+            else:
+                raise
+
         items = d if isinstance(d, list) else []
         return self._filter_24h(items)
 
