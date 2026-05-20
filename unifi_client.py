@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""unifi_client.py — UniFi REST API wrapper with proper 24h filtering."""
+"""unifi_client.py — UniFi REST API wrapper with 24h filtering and 10.x fallbacks."""
 
 import datetime
 import requests
@@ -28,33 +28,44 @@ class UniFiClient:
         self.api_key    = api_key
         self.site_id    = site_id
         self.site_name  = site_name
-        # ✅ Keep original /proxy/network base path (it works for most calls)
         self._base      = f"https://{console_ip}/proxy/network"
         self._headers   = {"X-API-KEY": api_key, "Accept": "application/json"}
+        # Track which endpoint paths worked, for diagnostics
+        self._endpoint_status = {}
 
     # ── HTTP ───────────────────────────────────────────────────────────────
-    def _get(self, path):
-        r = requests.get(
-            f"{self._base}{path}",
-            headers=self._headers,
-            verify=False,
-            timeout=15,
-        )
-        r.raise_for_status()
-        body = r.json()
-        return body.get("data", body)
+    def _get(self, path, raise_on_error=True):
+        try:
+            r = requests.get(
+                f"{self._base}{path}",
+                headers=self._headers,
+                verify=False,
+                timeout=15,
+            )
+            r.raise_for_status()
+            body = r.json()
+            self._endpoint_status[path] = "ok"
+            return body.get("data", body)
+        except Exception as e:
+            self._endpoint_status[path] = f"FAIL: {type(e).__name__}: {str(e)[:80]}"
+            if raise_on_error:
+                raise
+            return None
+
+    def _try_paths(self, paths):
+        """Try multiple endpoint paths, return first one that works."""
+        for path in paths:
+            data = self._get(path, raise_on_error=False)
+            if isinstance(data, list):
+                return data
+        return []
 
     def _filter_24h(self, items):
-        """
-        Filter to last 24h. Handles both:
-          - ISO datetime string  (alarms: 'datetime' field)
-          - Unix timestamp int   (events: 'time' field, milliseconds or seconds)
-        """
+        """Handles both ISO datetime (alarms) and Unix time (events)."""
         cutoff = datetime.datetime.now(datetime.timezone.utc) - _24H
         cutoff_ts = cutoff.timestamp()
         out = []
         for item in (items or []):
-            # Try ISO datetime field first (alarms)
             raw = item.get("datetime")
             if raw:
                 try:
@@ -64,12 +75,10 @@ class UniFiClient:
                     continue
                 except Exception:
                     pass
-            # Try unix timestamp (events use 'time' in seconds)
             ts = item.get("time")
             if ts:
                 try:
                     ts = float(ts)
-                    # UniFi sometimes returns ms, sometimes seconds
                     if ts > 1e12:
                         ts /= 1000
                     if ts > cutoff_ts:
@@ -78,22 +87,18 @@ class UniFiClient:
                     pass
         return out
 
-    # ── Raw fetchers ───────────────────────────────────────────────────────
+    # ── Raw fetchers (now with fallbacks for UniFi 10.x) ───────────────────
     def _clients(self):
-        """
-        Use internal stat/sta endpoint - returns all known clients including
-        recently offline ones, no pagination limit unlike the integration API.
-        """
-        d = self._get(f"/api/s/{self.site_name}/stat/sta")
+        d = self._get(f"/api/s/{self.site_name}/stat/sta", raise_on_error=False)
         if isinstance(d, list):
             return d
-        # Fallback: integration API with pagination
+        # Integration API fallback
         all_clients = []
         page = 1
         while True:
             d = self._get(
-                f"/integration/v1/sites/{self.site_id}/clients"
-                f"?pageSize=200&page={page}"
+                f"/integration/v1/sites/{self.site_id}/clients?pageSize=200&page={page}",
+                raise_on_error=False,
             )
             if not isinstance(d, list) or not d:
                 break
@@ -104,41 +109,33 @@ class UniFiClient:
         return all_clients
 
     def _alarms_24h(self):
-        d = self._get(f"/api/s/{self.site_name}/stat/alarm?archived=false")
-        return self._filter_24h(d if isinstance(d, list) else [])
+        """UniFi 10.x changed stat/alarm to list/alarm. Try both."""
+        data = self._try_paths([
+            f"/api/s/{self.site_name}/list/alarm?archived=false",
+            f"/api/s/{self.site_name}/stat/alarm?archived=false",
+            f"/api/s/{self.site_name}/rest/alarm?archived=false",
+        ])
+        return self._filter_24h(data)
 
-    # ✅ UPDATED: Changed from /stat/event to /stat/alarm with limit fallback
     def _events_24h(self):
-        """
-        Attempt /stat/alarm first (UniFi v3+), then fallback to /rest/stat/eventlog.
-        Returns filtered events in last 24h.
-        """
-        # First try /stat/alarm?archived=false&_limit=500 (v3-compatible)
-        try:
-            d = self._get(f"/api/s/{self.site_name}/stat/alarm?archived=false&_limit=500")
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                # Fallback: /rest/stat/eventlog (some installs use this)
-                try:
-                    d = self._get(f"/api/s/{self.site_name}/rest/stat/eventlog?_limit=500")
-                except Exception:
-                    return []
-            else:
-                raise
-
-        items = d if isinstance(d, list) else []
-        return self._filter_24h(items)
+        """UniFi 10.x — events may have moved. Try generic then IPS paths."""
+        data = self._try_paths([
+            f"/api/s/{self.site_name}/stat/event?_limit=500",
+            f"/api/s/{self.site_name}/list/event?_limit=500",
+            f"/api/s/{self.site_name}/stat/ips/event?_limit=500",
+        ])
+        return self._filter_24h(data)
 
     def _rogue_aps(self):
-        d = self._get(f"/api/s/{self.site_name}/stat/rogueap")
+        d = self._get(f"/api/s/{self.site_name}/stat/rogueap", raise_on_error=False)
         return d if isinstance(d, list) else []
 
     def _devices(self):
-        d = self._get(f"/api/s/{self.site_name}/stat/device")
+        d = self._get(f"/api/s/{self.site_name}/stat/device", raise_on_error=False)
         return d if isinstance(d, list) else []
 
     def _health(self):
-        d = self._get(f"/api/s/{self.site_name}/stat/health")
+        d = self._get(f"/api/s/{self.site_name}/stat/health", raise_on_error=False)
         return d if isinstance(d, list) else []
 
     # ── Public ─────────────────────────────────────────────────────────────
@@ -150,15 +147,10 @@ class UniFiClient:
             return {"ok": False, "error": str(e)}
 
     def fetch_diagnostics(self):
-        """
-        Returns raw sample records so you can verify the data
-        matches what you actually see in the UniFi dashboard.
-        """
         events  = self._events_24h()
         alarms  = self._alarms_24h()
         clients = self._clients()
 
-        # Events use unix 'time' field; convert to readable string for display
         def event_ts(e):
             ts = e.get("time")
             if not ts:
@@ -171,7 +163,6 @@ class UniFiClient:
         newest = event_ts(events[0])  if events else None
         oldest = event_ts(events[-1]) if events else None
 
-        # Slim client list for the table (just the fields we need)
         clients_raw = [
             {
                 "hostname": c.get("hostname") or c.get("name") or "",
@@ -183,19 +174,16 @@ class UniFiClient:
         ]
 
         return {
-            "preset":           "diagnostics",
-            "event_count_24h":  len(events),
-            "alarm_count_24h":  len(alarms),
-            "client_count":     len(clients),
-            "clients_raw":      clients_raw,
-            "event_time_range": {
-                "newest": newest,
-                "oldest": oldest,
-            },
-            # Single raw sample records for field-level inspection
-            "sample_event":  events[0]  if events  else None,
-            "sample_alarm":  alarms[0]  if alarms  else None,
-            "sample_client": clients[0] if clients else None,
+            "preset":            "diagnostics",
+            "event_count_24h":   len(events),
+            "alarm_count_24h":   len(alarms),
+            "client_count":      len(clients),
+            "clients_raw":       clients_raw,
+            "event_time_range":  {"newest": newest, "oldest": oldest},
+            "sample_event":      events[0]  if events  else None,
+            "sample_alarm":      alarms[0]  if alarms  else None,
+            "sample_client":     clients[0] if clients else None,
+            "endpoint_status":   dict(self._endpoint_status),
         }
 
     def fetch_security_data(self):
@@ -206,17 +194,14 @@ class UniFiClient:
 
         client_rows = [
             {
-                # stat/sta uses 'hostname', integration API uses 'name'
                 "hostname": c.get("hostname") or c.get("name") or c.get("oui", "—"),
-                # stat/sta uses 'ip', may also be in 'fixed_ip'
                 "ip":       c.get("ip") or c.get("fixed_ip", "—"),
                 "mac":      c.get("mac", "—"),
-                # stat/sta: wired=0/wireless=1, integration: 'WIRED'/'WIRELESS'
                 "type":     c.get("type") or ("Wireless" if c.get("is_wired") is False
                              else "Wired" if c.get("is_wired") else "—"),
             }
             for c in clients
-            if c.get("mac")   # skip any malformed entries
+            if c.get("mac")
         ]
 
         event_counts = {}
@@ -232,7 +217,6 @@ class UniFiClient:
             or "block" in str(e.get("msg", "")).lower()
         ]
 
-        # WAN summary for broadband context
         health = self._health()
         wan = next((h for h in health if h.get("subsystem") == "wan"), {})
         wan_info = {
@@ -241,6 +225,15 @@ class UniFiClient:
             "rx_mb":   _mb(wan.get("rx_bytes")),
             "tx_mb":   _mb(wan.get("tx_bytes")),
         }
+
+        try:
+            our_ssids = {d.get("name", "") for d in self._devices() if d.get("name")}
+            evil_twins = [
+                r.get("bssid") for r in rogues
+                if r.get("ssid") and r.get("ssid") in our_ssids
+            ]
+        except Exception:
+            evil_twins = []
 
         return {
             "preset":          "security",
@@ -255,7 +248,6 @@ class UniFiClient:
             "block_count":     len(blocks),
             "firewall_blocks": blocks[:10],
             "rogue_ap_count":  len(rogues),
-            # Full rogue AP detail for meaningful LLM analysis
             "rogue_aps": [
                 {
                     "ssid":     r.get("ssid", ""),
@@ -267,14 +259,8 @@ class UniFiClient:
                 }
                 for r in sorted(rogues, key=lambda x: x.get("rssi") or -999, reverse=True)[:30]
             ],
-            # Flag any rogue AP whose SSID matches one of our own networks
-            "evil_twin_candidates": [
-                r.get("bssid") for r in rogues
-                if r.get("ssid") and r.get("ssid") in [
-                    d.get("name","") for d in self._devices()
-                    if d.get("name")
-                ]
-            ],
+            "evil_twin_candidates": evil_twins,
+            "endpoint_status": dict(self._endpoint_status),
         }
 
     def fetch_health_data(self):
