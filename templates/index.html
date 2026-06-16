@@ -642,6 +642,179 @@ function switchPreset(p, btn) {
     Click <strong>Fetch Data</strong> to load ${TITLES[p]}</div>`;
 }
 
+// ── Bandwidth Trends ─────────────────────────────────────────────────────────
+// History is built from the snapshot saved on every Fetch Data call (see db.py).
+// A client needs >= 2 snapshots with a positive byte delta before a trend exists.
+let trendData = null;   // payload handed to the AI analyzer for the trends preset
+
+async function loadTrends() {
+  const panel = id('dataPanel');
+  panel.innerHTML = `<div class="empty" style="margin-top:50px">Loading trend history…</div>`;
+  let clients;
+  try {
+    clients = await apiFetch('/api/trends/clients');
+  } catch (e) {
+    panel.innerHTML = `<div class="empty" style="color:var(--danger)">Error loading trends: ${esc(e.message)}</div>`;
+    return;
+  }
+  if (!Array.isArray(clients) || clients.length === 0) {
+    panel.innerHTML = `<div class="empty" style="margin-top:40px;line-height:1.6">
+      <strong>No trend history yet.</strong><br>
+      The dashboard records a snapshot every time you <strong>Fetch Data</strong> on any tab.
+      Fetch a few times across separate runs to build history, then come back here.</div>`;
+    return;
+  }
+
+  const opts = clients.map(c => {
+    const label = `${c.hostname || '(unnamed)'} — ${c.ip || 'no ip'}  [${c.mac}]`;
+    return `<option value="${esc(c.mac)}">${esc(label)}</option>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="card" style="padding:12px 14px">
+      <div class="metric-label" style="margin-bottom:6px">Client</div>
+      <select id="trendClient" onchange="loadTrendSeries(this.value)"
+        style="width:100%;padding:8px 10px;background:var(--bg);color:var(--text);
+        border:1px solid var(--border);border-radius:6px;font-size:13px">
+        ${opts}
+      </select>
+    </div>
+    <div id="trendBody"></div>`;
+
+  // Auto-load the first client
+  loadTrendSeries(clients[0].mac);
+}
+
+async function loadTrendSeries(mac) {
+  const body = id('trendBody');
+  if (!body) return;
+  body.innerHTML = `<div class="empty" style="margin-top:30px">Loading…</div>`;
+  trendData = null;
+
+  let series;
+  try {
+    series = await apiFetch('/api/trends/series/' + encodeURIComponent(mac));
+  } catch (e) {
+    body.innerHTML = `<div class="empty" style="color:var(--danger)">Error: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  if (!Array.isArray(series) || series.length < 2) {
+    body.innerHTML = `<div class="empty" style="margin-top:30px;line-height:1.6">
+      Not enough history for this client yet — need at least 2 snapshots with measured
+      traffic.<br>Fetch Data again later (across separate runs) to build a trend.</div>`;
+    return;
+  }
+
+  const hostname = series[series.length - 1].hostname || mac;
+  const totRx = series.reduce((a, s) => a + s.rx_mb, 0);
+  const totTx = series.reduce((a, s) => a + s.tx_mb, 0);
+  const t     = computeTrend(series);
+  const range = `${series[0].captured_at} → ${series[series.length - 1].captured_at}`;
+
+  // Stash for the AI analyzer
+  trendData = {
+    hostname, mac,
+    summary: {
+      intervals: series.length,
+      date_range: range,
+      total_rx_mb: +totRx.toFixed(1),
+      total_tx_mb: +totTx.toFixed(1),
+      trend: t.label,
+      recent_vs_earlier_pct: +t.pct.toFixed(0),
+    },
+    series,
+  };
+
+  const badge = `<span style="display:inline-block;padding:2px 10px;border-radius:10px;
+    font-size:11px;font-weight:600;background:var(--${t.cls}-bg,rgba(255,255,255,.06));
+    color:var(--${t.cls},var(--text-mid))">${esc(t.label)}${
+      t.dir === 'up' || t.dir === 'down' ? ` (${t.pct > 0 ? '+' : ''}${t.pct.toFixed(0)}%)` : ''}</span>`;
+
+  body.innerHTML = `
+    <div class="metrics" style="grid-template-columns:repeat(4,1fr);margin-top:10px">
+      <div class="metric-card"><div class="metric-label">Intervals</div>
+        <div class="metric-val">${series.length}</div></div>
+      <div class="metric-card"><div class="metric-label">Total ↓ RX</div>
+        <div class="metric-val">${fmtMB(totRx)}</div></div>
+      <div class="metric-card"><div class="metric-label">Total ↑ TX</div>
+        <div class="metric-val">${fmtMB(totTx)}</div></div>
+      <div class="metric-card"><div class="metric-label">Trend</div>
+        <div style="margin-top:6px">${badge}</div></div>
+    </div>
+
+    <div class="card" style="padding:12px 14px">
+      <div class="metric-label" style="margin-bottom:8px">
+        Per-interval bandwidth &nbsp;·&nbsp;
+        <span style="color:var(--accent)">■</span> download
+        &nbsp; <span style="color:var(--warn)">■</span> upload
+      </div>
+      ${renderTrendChart(series)}
+      <div style="font-size:10px;color:var(--text-dim);margin-top:6px">${esc(range)}</div>
+    </div>
+
+    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px"
+      onclick="analyzeTrend()">Analyze trend with AI</button>`;
+}
+
+function fmtMB(mb) {
+  if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
+  return mb.toFixed(1) + ' MB';
+}
+
+// Trend = recent third vs earlier third of combined (rx+tx) per-interval traffic.
+function computeTrend(series) {
+  const tot = series.map(s => s.rx_mb + s.tx_mb);
+  const n = tot.length;
+  const k = Math.max(1, Math.floor(n / 3));
+  const firstAvg = tot.slice(0, k).reduce((a, b) => a + b, 0) / k;
+  const lastAvg  = tot.slice(-k).reduce((a, b) => a + b, 0) / k;
+  const pct = firstAvg > 0 ? ((lastAvg - firstAvg) / firstAvg) * 100
+                           : (lastAvg > 0 ? 100 : 0);
+  if (n < 4)        return {dir: 'unknown', label: 'Insufficient history', cls: 'dim',  pct};
+  if (pct >  25)    return {dir: 'up',      label: 'Trending up',          cls: 'warn', pct};
+  if (pct < -25)    return {dir: 'down',    label: 'Trending down',        cls: 'ok',   pct};
+  return                   {dir: 'stable',  label: 'Stable',               cls: 'ok',   pct};
+}
+
+function renderTrendChart(series) {
+  const W = 640, H = 200, padL = 46, padR = 14, padT = 12, padB = 30;
+  const n = series.length;
+  const maxV = Math.max(0.001, ...series.map(s => Math.max(s.rx_mb, s.tx_mb)));
+  const xAt = i => padL + (n === 1 ? 0 : i * (W - padL - padR) / (n - 1));
+  const yAt = v => H - padB - (v / maxV) * (H - padT - padB);
+  const path = key => series
+    .map((s, i) => `${i ? 'L' : 'M'}${xAt(i).toFixed(1)},${yAt(s[key]).toFixed(1)}`)
+    .join(' ');
+
+  // y gridlines at 0, 50%, 100% of max
+  const grid = [0, 0.5, 1].map(f => {
+    const v = maxV * f, y = yAt(v);
+    return `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"
+              stroke="var(--border)" stroke-width="1" opacity="0.5"/>
+            <text x="${padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end"
+              font-size="9" fill="var(--text-dim)">${fmtMB(v)}</text>`;
+  }).join('');
+
+  const dots = key => series.map((s, i) =>
+    `<circle cx="${xAt(i).toFixed(1)}" cy="${yAt(s[key]).toFixed(1)}" r="2"
+       fill="var(--${key === 'rx_mb' ? 'accent' : 'warn'})"/>`).join('');
+
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet"
+            style="display:block">
+    ${grid}
+    <path d="${path('rx_mb')}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <path d="${path('tx_mb')}" fill="none" stroke="var(--warn)" stroke-width="2"/>
+    ${dots('rx_mb')}${dots('tx_mb')}
+  </svg>`;
+}
+
+function analyzeTrend() {
+  if (!trendData) return;
+  fetchedData = trendData;   // runAnalysis posts this under the active 'trends' preset
+  runAnalysis('');
+}
+
 // ── Fetch data ─────────────────────────────────────────────────────────────
 async function fetchData() {
   const btn = id('fetchBtn');

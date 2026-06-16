@@ -61,6 +61,55 @@ DATA:
 {json.dumps(data, indent=2)}"""
 
 
+def build_diagnostics_prompt(data: dict) -> str:
+    return f"""You are validating the DATA PIPELINE of a home-network dashboard — NOT hunting for security threats.
+
+Your job is to sanity-check that the data pulled from the UniFi controller looks complete and internally consistent, so the user can trust the security/health/performance analyses. Do NOT perform a security review here.
+
+Check for:
+- Missing or zero/empty fields where data is expected. event_count_24h, alarm_count_24h, or client_count all being zero (or empty sample objects) usually means a broken fetch path or a wrong API endpoint, not a quiet network.
+- event_time_range: is the window plausible? A 'newest' timestamp in the future, or one that is hours/days stale, suggests events aren't updating.
+- client_count vs the length of clients_raw — do they agree? A mismatch suggests truncation or a paging bug.
+- clients_raw rows missing hostname/ip/mac or holding obviously malformed values.
+- sample_alarm / sample_event / sample_client: do the field shapes look like real UniFi objects, or are they null/empty (endpoint returning nothing)?
+
+Instructions:
+- Frame every finding as a DATA QUALITY status: OK / SUSPECT / BROKEN — not a security severity.
+- Point to the specific field or count that looks wrong and say what it implies about the fetch path.
+- If the data looks complete and consistent, say so plainly — do not invent problems.
+- Bullet points, concise.
+- End with a single-line overall verdict on data integrity.
+
+DATA:
+{json.dumps(data, indent=2)}"""
+
+
+def build_trends_prompt(data: dict) -> str:
+    return f"""You are analyzing BANDWIDTH TRENDS for a home network, using snapshots collected across separate dashboard runs over time.
+
+Each data point is the bandwidth a single client consumed in the interval between two consecutive snapshots: rx_mb = download, tx_mb = upload. The goal is to separate benign, stable usage from patterns that are persistent or getting worse run over run.
+
+Analyze:
+- Direction: are rx and tx trending UP, DOWN, or STABLE across the series? Quantify roughly (recent intervals vs earlier ones).
+- Persistence: is elevated usage a one-off spike (usually benign) or sustained across many snapshots (worth attention)?
+- Upload emphasis: sustained or rising TX on a NON-camera client can indicate cloud sync, backups, or unexpected exfiltration — flag it, but remember cameras and backup tools legitimately upload heavily on a home network.
+- Anomalies for a home device: sudden step-changes, suspiciously regular intervals, or growth that compounds across runs.
+
+Context:
+- This is a HOME network. iCloud/OneDrive/Dropbox sync, Windows Update delivery, and camera uploads are all normal.
+- A short series (few intervals) means LOW confidence — say so rather than over-reading noise.
+
+Instructions:
+- Classify the trend: BENIGN / WATCH / WORSENING.
+- Reference actual MB figures and timestamps from the data.
+- If there isn't enough history to judge, say so and state roughly how many more snapshots would help.
+- Bullet points, concise.
+- End with a single-line overall verdict.
+
+DATA:
+{json.dumps(data, indent=2)}"""
+
+
 def build_performance_prompt(data: dict) -> str:
     return f"""You are a network performance analyst reviewing a home broadband connection and LAN.
 

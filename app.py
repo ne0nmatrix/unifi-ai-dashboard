@@ -15,8 +15,14 @@ from flask import Flask, jsonify, render_template, request, Response, stream_wit
 
 from unifi_client import UniFiClient
 from lmstudio_client import LMStudioClient
-from prompts import build_security_prompt, build_health_prompt, build_performance_prompt
-from db import init_db, save_snapshot, get_known_clients, get_before_after
+from prompts import (
+    build_security_prompt,
+    build_health_prompt,
+    build_performance_prompt,
+    build_diagnostics_prompt,
+    build_trends_prompt,
+)
+from db import init_db, save_snapshot, get_known_clients, get_before_after, get_bandwidth_series
 
 load_dotenv()
 
@@ -33,6 +39,7 @@ unifi = UniFiClient(
 lmstudio = LMStudioClient(
     base_url=os.getenv("LLM_ENDPOINT", "http://localhost:1234"),
     default_model=os.getenv("LLM_MODEL", ""),
+    max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
 )
 
 
@@ -102,11 +109,15 @@ def analyze():
             "security": build_security_prompt,
             "health": build_health_prompt,
             "performance": build_performance_prompt,
+            "diagnostics": build_diagnostics_prompt,
+            "trends": build_trends_prompt,
         }
         prompt = builders.get(preset, build_security_prompt)(data)
 
     def generate():
-        for chunk in lmstudio.stream_inference(prompt, model=model or lmstudio.default_model):
+        # Pass model through as-is (may be None); stream_inference resolves the
+        # fallback to the currently-loaded model via get_loaded_model().
+        for chunk in lmstudio.stream_inference(prompt, model=model):
             yield f"data: {json.dumps({'chunk': chunk})}\n\n"
         yield f"data: {json.dumps({'done': True})}\n\n"
 
@@ -140,6 +151,11 @@ def unload_model():
 def trends_clients():
     return jsonify(get_known_clients())
 
+@app.route("/api/trends/series/<path:mac>")
+def trends_series(mac):
+    """Per-interval bandwidth history (MB) for one client, oldest→newest."""
+    return jsonify(get_bandwidth_series(mac))
+
 @app.route("/api/trends/compare")
 def trends_compare():
     mac = request.args.get("mac", "")
@@ -154,5 +170,14 @@ if __name__ == "__main__":
     import webbrowser
     print("\n UniFi AI Dashboard")
     print(" http://localhost:5000\n")
-    webbrowser.open("http://localhost:5000")
+    # Open the browser only once, and only on a real cold start.
+    #  - WERKZEUG_RUN_MAIN guard: with debug=True the reloader runs this module in
+    #    two processes; the child sets WERKZEUG_RUN_MAIN=true. Skipping it there
+    #    means a single tab at startup and no new tab on each code reload.
+    #  - OPEN_BROWSER=0 in .env disables auto-open entirely. Recommended if you
+    #    pin/bookmark http://localhost:5000: the relaunch shortcut restarts the
+    #    server under your existing tab instead of spawning a duplicate.
+    if (os.getenv("OPEN_BROWSER", "1") == "1"
+            and os.environ.get("WERKZEUG_RUN_MAIN") != "true"):
+        webbrowser.open("http://localhost:5000")
     app.run(host="127.0.0.1", port=5000, debug=True, threaded=True)
