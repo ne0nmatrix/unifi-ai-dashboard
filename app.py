@@ -180,4 +180,9 @@ if __name__ == "__main__":
     if (os.getenv("OPEN_BROWSER", "1") == "1"
             and os.environ.get("WERKZEUG_RUN_MAIN") != "true"):
         webbrowser.open("http://localhost:5000")
-    app.run(host="127.0.0.1", port=5000, debug=True, threaded=True)
+    # FLASK_DEBUG=0 runs a clean single-process service (no auto-reloader) — used
+    # when launched headless as a background backend (e.g. from restart-console.ps1
+    # for the Mission Console UniFi tab). Defaults to 1, preserving dev behavior.
+    debug = os.getenv("FLASK_DEBUG", "1") == "1"
+    app.run(host="127.0.0.1", port=5000, debug=debug,
+            use_reloader=debug, threaded=True)
