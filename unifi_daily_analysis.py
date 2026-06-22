@@ -82,10 +82,15 @@ def api_get(path):
         print(f"[ERROR] Cannot reach {url} — is the console IP correct?")
         sys.exit(1)
     except requests.exceptions.HTTPError as e:
-        print(f"[ERROR] HTTP {e.response.status_code} from {url}")
-        if e.response.status_code == 401:
+        code = e.response.status_code
+        # Don't let one bad endpoint kill the whole run. Some UniFi-OS controllers
+        # 404 on specific internal-API paths (e.g. stat/event). Warn and continue so
+        # the other sections (clients / alarms / rogue APs) still report. 401 is fatal.
+        print(f"[WARN] HTTP {code} from {url}")
+        if code == 401:
             print("        API key rejected — check UNIFI_API_KEY in .env")
-        sys.exit(1)
+            sys.exit(1)
+        return []
 
 
 # ── Discovery mode ────────────────────────────────────────────────────────────
