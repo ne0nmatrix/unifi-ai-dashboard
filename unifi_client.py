@@ -138,6 +138,28 @@ class UniFiClient:
         d = self._get(f"/api/s/{self.site_name}/stat/health", raise_on_error=False)
         return d if isinstance(d, list) else []
 
+    def _sysinfo(self):
+        d = self._get(f"/api/s/{self.site_name}/stat/sysinfo", raise_on_error=False)
+        return d if isinstance(d, list) else []
+
+    def controller_version(self):
+        """UniFi Network application version — governs which API endpoints exist.
+        Event endpoints move/disappear across Network 10.x, so reports should record
+        the version they ran against."""
+        si = self._sysinfo()
+        if si and isinstance(si[0], dict):
+            return si[0].get("version") or si[0].get("build") or "unknown"
+        return "unknown"
+
+    def _events_endpoint_ok(self):
+        """True if ANY event-fetch path returned successfully (vs all 400/404).
+        Lets the diagnostics distinguish 'events endpoint moved' from 'pipeline broken'."""
+        return any(
+            status == "ok"
+            for path, status in self._endpoint_status.items()
+            if "event" in path
+        )
+
     # ── Public ─────────────────────────────────────────────────────────────
     def test_connection(self):
         try:
@@ -174,11 +196,13 @@ class UniFiClient:
         ]
 
         return {
-            "preset":            "diagnostics",
-            "event_count_24h":   len(events),
-            "alarm_count_24h":   len(alarms),
-            "client_count":      len(clients),
-            "clients_raw":       clients_raw,
+            "preset":             "diagnostics",
+            "controller_version": self.controller_version(),
+            "events_endpoint_ok": self._events_endpoint_ok(),
+            "event_count_24h":    len(events),
+            "alarm_count_24h":    len(alarms),
+            "client_count":       len(clients),
+            "clients_raw":        clients_raw,
             "event_time_range":  {"newest": newest, "oldest": oldest},
             "sample_event":      events[0]  if events  else None,
             "sample_alarm":      alarms[0]  if alarms  else None,
@@ -236,10 +260,12 @@ class UniFiClient:
             evil_twins = []
 
         return {
-            "preset":          "security",
-            "period":          "last 24 hours",
-            "wan":             wan_info,
-            "client_count":    len(client_rows),
+            "preset":             "security",
+            "period":             "last 24 hours",
+            "controller_version": self.controller_version(),
+            "events_endpoint_ok": self._events_endpoint_ok(),
+            "wan":                wan_info,
+            "client_count":       len(client_rows),
             "clients":         client_rows,
             "alarm_count":     len(alarms),
             "alarms":          [a.get("msg", "") for a in alarms[:20]],

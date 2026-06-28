@@ -138,8 +138,24 @@ def fetch_events_24h():
     return data if isinstance(data, list) else []
 
 def fetch_clients():
-    data = api_get(f"/integration/v1/sites/{SITE_ID}/clients")
-    return data if isinstance(data, list) else []
+    # Internal API first: stat/sta returns ALL active stations in one call (no paging),
+    # which is what the Flask dashboard uses and why it correctly reports ~70.
+    data = api_get(f"/api/s/{SITE_NAME}/stat/sta")
+    if isinstance(data, list):
+        return data
+    # Integration API fallback — it PAGINATES with a default page size of 25, so a bare
+    # call silently returns only the first 25. Walk pages with an explicit large pageSize.
+    all_clients = []
+    page = 1
+    while True:
+        d = api_get(f"/integration/v1/sites/{SITE_ID}/clients?pageSize=200&page={page}")
+        if not isinstance(d, list) or not d:
+            break
+        all_clients.extend(d)
+        if len(d) < 200:
+            break
+        page += 1
+    return all_clients
 
 def fetch_alarms():
     data = api_get(f"/api/s/{SITE_NAME}/stat/alarm?archived=false")
