@@ -39,6 +39,10 @@ CONSOLE_IP   = os.getenv("UNIFI_CONSOLE_IP")
 API_KEY      = os.getenv("UNIFI_API_KEY")
 SITE_ID      = os.getenv("UNIFI_SITE_ID")       # from --discover step
 LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "http://localhost:1234/v1/chat/completions")
+# Tolerate a bare host:port in .env (2026-07-15: LLM_ENDPOINT=http://localhost:1234
+# made the POST land on LM Studio's root and die with KeyError 'choices').
+if "/chat/completions" not in LLM_ENDPOINT:
+    LLM_ENDPOINT = LLM_ENDPOINT.rstrip("/") + "/v1/chat/completions"
 LLM_MODEL    = os.getenv("LLM_MODEL")
 REPORT_DIR   = Path(os.getenv("REPORT_DIR", "reports"))
 BASELINE_FILE = REPORT_DIR / "baseline.json"
@@ -380,7 +384,15 @@ Instructions:
     except requests.exceptions.ConnectionError:
         return f"[ERROR] Could not reach LLM at {LLM_ENDPOINT} — is LM Studio running?"
     except (KeyError, IndexError) as e:
-        return f"[ERROR] Unexpected LLM response format: {e}"
+        # show WHAT came back, not just which key was missing — a wrong
+        # endpoint, an unloaded model, or an LM Studio error object all
+        # produce this, and the body names the real reason
+        try:
+            body = json.dumps(r.json())[:300]
+        except Exception:
+            body = (r.text or "")[:300]
+        return (f"[ERROR] Unexpected LLM response format ({e}) from "
+                f"{LLM_ENDPOINT} — response: {body}")
 
 
 # ── Report writer ─────────────────────────────────────────────────────────────
