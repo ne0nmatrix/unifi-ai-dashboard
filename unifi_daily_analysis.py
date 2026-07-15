@@ -21,6 +21,7 @@ import datetime
 import json
 import os
 import sys
+import time
 import urllib3
 from pathlib import Path
 
@@ -68,8 +69,12 @@ def make_headers():
         "Accept":    "application/json",
     }
 
-def api_get(path):
-    """GET from UniFi console; returns the inner data list/dict."""
+def api_get(path, quiet=False):
+    """GET from UniFi console; returns the inner data list/dict, or None on
+    HTTP failure (so callers can tell 'endpoint broken' from 'legitimately
+    empty' — the old []-on-404 made a quiet night and a dead endpoint look
+    identical). quiet=True suppresses the WARN, for fallback chains that only
+    warn when EVERY variant fails."""
     url = f"https://{CONSOLE_IP}/proxy/network{path}"
     try:
         r = requests.get(url, headers=make_headers(), verify=False, timeout=15)
@@ -83,14 +88,36 @@ def api_get(path):
         sys.exit(1)
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code
-        # Don't let one bad endpoint kill the whole run. Some UniFi-OS controllers
-        # 404 on specific internal-API paths (e.g. stat/event). Warn and continue so
-        # the other sections (clients / alarms / rogue APs) still report. 401 is fatal.
-        print(f"[WARN] HTTP {code} from {url}")
+        # Don't let one bad endpoint kill the whole run. 401 is fatal.
+        if not quiet:
+            print(f"[WARN] HTTP {code} from {url}")
         if code == 401:
             print("        API key rejected — check UNIFI_API_KEY in .env")
             sys.exit(1)
-        return []
+        return None
+
+
+def api_post(path, body, quiet=False):
+    """POST a query to the UniFi console (the v2 endpoints are POST-queries,
+    not mutations). Same return contract as api_get."""
+    url = f"https://{CONSOLE_IP}/proxy/network{path}"
+    try:
+        r = requests.post(url, headers={**make_headers(), "Content-Type": "application/json"},
+                          json=body, verify=False, timeout=15)
+        r.raise_for_status()
+        b = r.json()
+        return b.get("data", b)
+    except requests.exceptions.ConnectionError:
+        print(f"[ERROR] Cannot reach {url} — is the console IP correct?")
+        sys.exit(1)
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code
+        if not quiet:
+            print(f"[WARN] HTTP {code} from {url}")
+        if code == 401:
+            print("        API key rejected — check UNIFI_API_KEY in .env")
+            sys.exit(1)
+        return None
 
 
 # ── Discovery mode ────────────────────────────────────────────────────────────
@@ -117,7 +144,7 @@ def discover():
 
     print("[ Internal API — alarms ]")
     site_path = SITE_ID or "default"
-    alarms = api_get(f"/api/s/{site_path}/stat/alarm")
+    alarms = api_get(f"/api/s/{site_path}/list/alarm")   # stat/alarm 404s on 10.4+
     count = len(alarms) if isinstance(alarms, list) else "?"
     print(f"  {count} unarchived alarms\n")
 
@@ -133,9 +160,58 @@ def discover():
 
 
 # ── Data fetchers ─────────────────────────────────────────────────────────────
+# v2 system-log enums, straight from the controller's own 400 error message
+# (unpoller/unifi#198, verified against 2026 firmware): send the full sets.
+V2_LOG_SEVERITIES = ["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
+V2_LOG_CATEGORIES = ["SECURITY", "UNIFI_DEVICES", "SOFTWARE_UPDATES", "VPN",
+                     "POWER", "UNIFI_ETHERNET_PORTS", "CLIENT_DEVICES",
+                     "UNKNOWN", "AUDIT", "INTERNET_AND_WAN"]
+
+
+def _normalize_v2_event(item):
+    """Map a v2 system-log record onto the legacy shape the analysis reads
+    (key / msg / time), keeping all original fields."""
+    e = dict(item)
+    e.setdefault("key", item.get("type") or item.get("category") or "v2-event")
+    e.setdefault("msg", item.get("message") or item.get("title")
+                 or item.get("description") or "")
+    e.setdefault("time", item.get("timestamp") or item.get("time"))
+    return e
+
+
 def fetch_events_24h():
-    data = api_get(f"/api/s/{SITE_NAME}/stat/event?within=24")
-    return data if isinstance(data, list) else []
+    """UniFi has moved the events endpoint twice (stat/event -> 404 on
+    Network 10.4+; list/event exists but 400s on shape). Try the CURRENT
+    endpoint first (v2 system-log/all, what the UI's System Log page calls),
+    then fall back quietly through the legacy variants; warn only when every
+    variant fails. probe_endpoints.py is the re-hunting tool if that happens."""
+    now_ms = int(time.time() * 1000)
+    v2_body = {"timestampFrom": now_ms - 24 * 3600 * 1000, "timestampTo": now_ms,
+               "pageNumber": 0, "pageSize": 1000,
+               "severities": V2_LOG_SEVERITIES, "categories": V2_LOG_CATEGORIES}
+    attempts = [
+        ("v2 system-log/all", True,
+         lambda: api_post(f"/v2/api/site/{SITE_NAME}/system-log/all", v2_body, quiet=True)),
+        ("stat/event", False,
+         lambda: api_get(f"/api/s/{SITE_NAME}/stat/event?within=24", quiet=True)),
+        ("list/event GET", False,
+         lambda: api_get(f"/api/s/{SITE_NAME}/list/event?within=24&_limit=500&_start=0", quiet=True)),
+        ("list/event POST", False,
+         lambda: api_post(f"/api/s/{SITE_NAME}/list/event",
+                          {"within": 24, "_limit": 500, "_start": 0}, quiet=True)),
+    ]
+    for label, is_v2, call in attempts:
+        data = call()
+        if data is None:
+            continue                      # endpoint failed - try next variant
+        if isinstance(data, dict):        # some v2 replies nest the list
+            data = data.get("data") or data.get("elements") or data.get("items") or []
+        if isinstance(data, list):
+            print(f"  [events] via {label} ({len(data)} in 24h)")
+            return [_normalize_v2_event(e) for e in data] if is_v2 else data
+    print("[WARN] ALL event endpoint variants failed (v2 system-log/all, "
+          "stat/event, list/event GET+POST) - run probe_endpoints.py to re-hunt")
+    return []
 
 def fetch_clients():
     # Internal API first: stat/sta returns ALL active stations in one call (no paging),
@@ -158,8 +234,17 @@ def fetch_clients():
     return all_clients
 
 def fetch_alarms():
-    data = api_get(f"/api/s/{SITE_NAME}/stat/alarm?archived=false")
-    return data if isinstance(data, list) else []
+    """stat/alarm 404s on Network 10.4+; list/alarm was confirmed working by
+    the 2026-06-27 probe run. Try it first, keep stat/alarm as the fallback
+    for older controllers."""
+    for label, path in (("list/alarm", f"/api/s/{SITE_NAME}/list/alarm?archived=false"),
+                        ("stat/alarm", f"/api/s/{SITE_NAME}/stat/alarm?archived=false")):
+        data = api_get(path, quiet=True)
+        if isinstance(data, list):
+            print(f"  [alarms] via {label} ({len(data)} unarchived)")
+            return data
+    print("[WARN] both alarm endpoints failed (list/alarm, stat/alarm)")
+    return []
 
 def fetch_rogue_aps():
     data = api_get(f"/api/s/{SITE_NAME}/stat/rogueap")
