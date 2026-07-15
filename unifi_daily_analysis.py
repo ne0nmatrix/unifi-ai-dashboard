@@ -250,6 +250,15 @@ def fetch_alarms():
     print("[WARN] both alarm endpoints failed (list/alarm, stat/alarm)")
     return []
 
+def fetch_own_ssids():
+    """Configured SSIDs from wlanconf — the reference set for the evil-twin
+    check. Quiet: if the endpoint moves someday, the check just degrades."""
+    data = api_get(f"/api/s/{SITE_NAME}/rest/wlanconf", quiet=True)
+    if not isinstance(data, list):
+        return set()
+    return {w.get("name") for w in data if w.get("name")}
+
+
 def fetch_rogue_aps():
     data = api_get(f"/api/s/{SITE_NAME}/stat/rogueap")
     return data if isinstance(data, list) else []
@@ -292,7 +301,21 @@ def update_baseline(current_macs: set, baseline: dict) -> dict:
 
 
 # ── Summarizer ────────────────────────────────────────────────────────────────
-def build_summary(events, clients, alarms, rogue_aps, baseline):
+def _alarm_ts(a):
+    """Best-effort alarm timestamp in epoch seconds (fields vary by version)."""
+    t = a.get("time")
+    if isinstance(t, (int, float)):
+        return t / 1000.0 if t > 1e12 else t
+    dt = a.get("datetime")
+    if isinstance(dt, str):
+        try:
+            return datetime.datetime.fromisoformat(dt.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def build_summary(events, clients, alarms, rogue_aps, baseline, own_ssids=None):
     today       = datetime.date.today()
     known_macs  = set(baseline.get("known_macs", []))
     current_macs = {c.get("mac") for c in clients if c.get("mac")}
@@ -315,11 +338,20 @@ def build_summary(events, clients, alarms, rogue_aps, baseline):
     ]
     block_msgs = [str(b.get("msg", b.get("key", "")))[:120] for b in blocks[:20]]
 
-    # Alarm messages
-    alarm_msgs = [str(a.get("msg", ""))[:120] for a in alarms[:15]]
+    # Alarms: list/alarm?archived=false is the ALL-TIME unarchived pile, not a
+    # 24h window (2026-07-15: 146 stale alarms — largely Syncthing-era IPS noise
+    # from before the 05-20 decommission — read as a fresh incident). Split by
+    # timestamp so the LLM reasons on what actually happened in the last day.
+    now = time.time()
+    recent_alarms = [a for a in alarms if (_alarm_ts(a) or 0) >= now - 24 * 3600]
+    alarm_msgs = [str(a.get("msg", ""))[:120] for a in recent_alarms[:15]]
 
-    # Rogue AP SSIDs
-    rogue_ssids = [r.get("ssid", r.get("bssid", "unknown")) for r in rogue_aps[:10]]
+    # Rogue APs + evil-twin check: dozens of neighbor APs are normal noise; a
+    # neighbor broadcasting OUR SSID is the actual attack signature.
+    _essid = lambda r: r.get("essid") or r.get("ssid") or ""
+    twins = [r for r in rogue_aps if own_ssids and _essid(r) in own_ssids]
+    twin_desc = [f"{_essid(r)} @ {r.get('bssid', '?')}" for r in twins[:10]]
+    rogue_ssids = [_essid(r) or r.get("bssid", "unknown") for r in rogue_aps[:10]]
 
     summary = f"""=== UniFi 24-Hour Security Summary — {today} ===
 
@@ -328,11 +360,12 @@ CLIENTS
   New vs baseline : {len(new_macs)}
   New MAC addresses: {sorted(new_macs) if new_macs else 'None'}
 
-ALARMS ({len(alarms)} unarchived)
-{json.dumps(alarm_msgs, indent=2)}
+ALARMS: {len(recent_alarms)} in last 24h ({len(alarms)} unarchived all-time backlog — old alarms, not current activity)
+{json.dumps(alarm_msgs, indent=2) if recent_alarms else '  (no new alarms in the last 24h)'}
 
-ROGUE ACCESS POINTS DETECTED: {len(rogue_aps)}
-  SSIDs: {rogue_ssids if rogue_ssids else 'None'}
+NEIGHBORING ("ROGUE") APs DETECTED: {len(rogue_aps)} (residential noise unless they broadcast our SSID)
+  Evil-twin check ({len(own_ssids or [])} own SSIDs compared): {twin_desc if twins else 'no neighbor AP broadcasts our SSIDs'}
+  Sample: {rogue_ssids if rogue_ssids else 'None'}
 
 FIREWALL BLOCK EVENTS ({len(blocks)} in last 24h)
 {json.dumps(block_msgs, indent=2)}
@@ -454,7 +487,9 @@ def main():
 
     # Summarize
     baseline = load_baseline()
-    summary, current_macs = build_summary(events, clients, alarms, rogue_aps, baseline)
+    own_ssids = fetch_own_ssids()
+    summary, current_macs = build_summary(events, clients, alarms, rogue_aps,
+                                          baseline, own_ssids)
     print(f"\n{'='*60}")
     print(summary)
     print('='*60)
@@ -473,11 +508,15 @@ def main():
     report_path = write_report(summary, analysis, args.dry_run)
     print(f"\nReport saved: {report_path}")
 
-    # Update baseline (only on full runs so dry runs don't pollute it)
-    if not args.dry_run:
-        baseline = update_baseline(current_macs, baseline)
-        BASELINE_FILE.write_text(json.dumps(baseline, indent=2), encoding="utf-8")
-        print("Baseline updated.")
+    # Update baseline on EVERY run, dry included. The daily brief runs
+    # --dry-run, so the old only-on-full-runs rule meant the baseline never
+    # matured and every device was "new vs baseline" forever (2026-07-15:
+    # all 66 clients flagged, LLM verdict rightly called the input absurd).
+    # Observing which MACs are present doesn't need the LLM.
+    baseline = update_baseline(current_macs, baseline)
+    BASELINE_FILE.write_text(json.dumps(baseline, indent=2), encoding="utf-8")
+    print("Baseline updated." + (" (dry run counts — the daily brief matures it)"
+                                 if args.dry_run else ""))
 
     print("\nDone.\n")
 
