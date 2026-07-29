@@ -7,7 +7,19 @@ import requests
 
 class LMStudioClient:
     def __init__(self, base_url: str, default_model: str, max_tokens: int = 4096):
-        self.base          = base_url.rstrip("/")
+        # This client appends the API paths itself (/v1/models,
+        # /v1/chat/completions, /api/v0/...). If LLM_ENDPOINT is a *full* endpoint
+        # (it ends in /v1/chat/completions — the form unifi_daily_analysis.py wants,
+        # set in .env on 2026-07-15), passing it straight through builds doubled
+        # URLs like /v1/chat/completions/v1/chat/completions. LM Studio answers
+        # those with an empty "200 anyway", which surfaces as "No model loaded" and
+        # "[No answer text was returned by the model.]". Normalise to the host root.
+        b = base_url.rstrip("/")
+        for suffix in ("/v1/chat/completions", "/v1/completions", "/v1"):
+            if b.endswith(suffix):
+                b = b[: -len(suffix)]
+                break
+        self.base          = b.rstrip("/")
         self.default_model = default_model
         self.max_tokens    = max_tokens
 
@@ -130,8 +142,9 @@ class LMStudioClient:
                 timeout=180,
             ) as r:
                 r.raise_for_status()
-                got_content   = False
-                finish_reason = None
+                got_content     = False
+                finish_reason   = None
+                reasoning_parts = []          # thinking-model output lands here
                 for line in r.iter_lines():
                     if not line:
                         continue
@@ -144,10 +157,17 @@ class LMStudioClient:
                         break
                     try:
                         choice = json.loads(payload)["choices"][0]
-                        # Render only the visible answer (content). A reasoning
-                        # model's thinking arrives under reasoning_content, which
-                        # we intentionally ignore.
-                        piece = choice.get("delta", {}).get("content", "")
+                        delta  = choice.get("delta", {})
+                        # Prefer the visible answer (content). Buffer any
+                        # reasoning_content so we can fall back to it if the model
+                        # thinks but never emits a final answer — which happens
+                        # when gemma is served with thinking ON (e.g. after an
+                        # LM Studio upgrade resets its per-model think-off default;
+                        # the named preset isn't applied to headless `lms load`).
+                        piece = delta.get("content", "")
+                        rc    = delta.get("reasoning_content", "")
+                        if rc:
+                            reasoning_parts.append(rc)
                         if choice.get("finish_reason"):
                             finish_reason = choice["finish_reason"]
                         if piece:
@@ -155,10 +175,18 @@ class LMStudioClient:
                             yield piece
                     except Exception:
                         pass
-                # A reasoning model can spend its whole budget thinking and never
-                # emit a visible answer. Surface that instead of a blank pane.
+                # A reasoning model can spend its whole turn thinking and never
+                # emit a visible answer. Rather than a blank pane, surface the
+                # reasoning — for an analysis task it IS the assessment.
                 if not got_content:
-                    if finish_reason == "length":
+                    reasoning = "".join(reasoning_parts).strip()
+                    if reasoning:
+                        yield ("_[No separate answer was emitted — this model "
+                               "returned only its reasoning (thinking is ON). "
+                               "Showing it below; for clean output, serve gemma "
+                               "with enableThinking=false.]_\n\n")
+                        yield reasoning
+                    elif finish_reason == "length":
                         yield ("[No answer returned: the model hit its token limit "
                                f"({self.max_tokens}) while reasoning. Raise "
                                "LLM_MAX_TOKENS in .env, or load a non-reasoning model.]")
